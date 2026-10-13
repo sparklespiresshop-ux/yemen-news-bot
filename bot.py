@@ -2,7 +2,7 @@
 """Yemen war news for a Telegram channel.
 
 Reads Arabic news feeds, keeps the items about the war in Yemen, and posts each new
-one to a Telegram channel. It is meant to run every 15 minutes on GitHub Actions
+one to a Telegram channel. It can also forward the war posts of public Telegram channels. It is meant to run every 15 minutes on GitHub Actions
 (.github/workflows/yemen-news.yml); state/seen.json remembers what was posted.
 
 Modes:
@@ -24,7 +24,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -37,6 +38,7 @@ USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like G
               "Chrome/124.0 Safari/537.36")
 YEMEN_TIME = timezone(timedelta(hours=3))  # Asia/Aden, no daylight saving
 GOOGLE_NEWS = "https://news.google.com/rss/search"
+TG_PREVIEW = "https://t.me/s/"  # a public channel's web page: its latest posts
 TOKEN_FORMAT = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
 # Invisible direction marks that come along when text is copied from an Arabic screen.
 _INVISIBLE = re.compile("[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
@@ -274,6 +276,8 @@ def _summary_adds(summary, title, source):
 
 
 def feed_url(feed, settings):
+    if feed.get("telegram"):
+        return TG_PREVIEW + tg_channel(feed["telegram"])
     if feed.get("google_news"):
         ed = settings["google_news_edition"]
         return (f"{GOOGLE_NEWS}?q={urllib.parse.quote(feed['google_news'], safe='')}"
@@ -322,8 +326,8 @@ def collect(config, now, log=print):
     """Every item of every enabled feed. A feed that fails is reported and skipped."""
     items, tried, read = [], 0, 0
     for feed in config["feeds"]:
-        if not feed.get("enabled", True):
-            continue
+        if not feed.get("enabled", True) or feed.get("telegram"):
+            continue  # Telegram channels are forwarded, not posted as news
         tried += 1
         try:
             got = parse_feed(fetch(feed_url(feed, config["settings"])), feed["name"], now)
@@ -338,6 +342,96 @@ def collect(config, now, log=print):
     return items
 
 
+# ---------------------------------------------------------------- Telegram channels
+def tg_channel(value):
+    """A public channel's username from @name, name or a t.me link (without the @)."""
+    v = _INVISIBLE.sub("", value or "").strip()
+    v = re.sub(r"^(?:https?://)?(?:www\.)?(?:t|telegram)\.me/(?:s/)?", "", v, flags=re.IGNORECASE)
+    return v.split("/")[0].split("?")[0].lstrip("@")
+
+
+@dataclass
+class TgPost:
+    channel: str
+    ids: list            # message ids, in order; an album has several
+    text: str
+    published: Optional[float]
+    link: str = field(default="")
+
+    @property
+    def last_id(self):
+        return self.ids[-1]
+
+
+class _TgPage(HTMLParser):
+    """Reads the posts of a channel's web page (t.me/s/name): id, album ids, text and time."""
+
+    def __init__(self, channel):
+        super().__init__(convert_charrefs=True)
+        self.channel = channel.lower()
+        self.single = re.compile(r"https?://t\.me/" + re.escape(self.channel) + r"/(\d+)\?single", re.IGNORECASE)
+        self.posts, self.cur, self.depth, self.text_depth = [], None, 0, None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        classes = (a.get("class") or "").split()
+        if tag == "div":
+            if self.cur is None:
+                ch, _, num = (a.get("data-post") or "").rpartition("/")
+                if "tgme_widget_message" in classes and ch.lower() == self.channel and num.isdigit():
+                    self.cur = {"ids": {int(num)}, "text": [], "time": None}
+                    self.depth = 1
+                return
+            self.depth += 1
+            if self.text_depth is None and "tgme_widget_message_text" in classes:
+                self.text_depth = self.depth
+            return
+        if self.cur is None:
+            return
+        if tag == "br" and self.text_depth is not None:
+            self.cur["text"].append("\n")
+        elif tag == "time" and self.cur["time"] is None and a.get("datetime"):
+            self.cur["time"] = a["datetime"]
+        elif tag == "a":
+            m = self.single.match(a.get("href") or "")
+            if m:
+                self.cur["ids"].add(int(m.group(1)))
+
+    def handle_endtag(self, tag):
+        if self.cur is None or tag != "div":
+            return
+        if self.text_depth == self.depth:
+            self.text_depth = None
+        self.depth -= 1
+        if self.depth == 0:
+            self.posts.append(self.cur)
+            self.cur = None
+
+    def handle_data(self, data):
+        if self.cur is not None and self.text_depth is not None:
+            self.cur["text"].append(data)
+
+
+def parse_tg_page(data, channel, now):
+    """The posts on a public channel's web page, oldest first."""
+    page = _TgPage(channel)
+    page.feed(data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data)
+    posts = []
+    for p in page.posts:
+        text = "\n".join(" ".join(line.split()) for line in "".join(p["text"]).split("\n")).strip()
+        published = None
+        if p["time"]:
+            try:
+                published = datetime.fromisoformat(p["time"]).timestamp()
+            except ValueError:
+                published = None
+        if published is not None and published > now + 600:
+            published = now
+        ids = sorted(p["ids"])
+        posts.append(TgPost(channel, ids, text, published, f"https://t.me/{channel}/{ids[0]}"))
+    return sorted(posts, key=lambda p: p.last_id)
+
+
 # ---------------------------------------------------------------- state
 def load_state(path):
     try:
@@ -348,6 +442,7 @@ def load_state(path):
     state.setdefault("seeded", False)
     state.setdefault("posted", {})   # item key -> time it was posted (or passed over)
     state.setdefault("titles", [])   # [time, normalized headline] of recent posts
+    state.setdefault("tg", {})       # Telegram channel -> the last post id handled
     return state
 
 
@@ -537,12 +632,132 @@ def chat_id_from(value):
     return "@" + v
 
 
+# ---------------------------------------------------------------- forwarding
+def link_message(name, post, now):
+    """The post shown as text and a link, when Telegram will not forward it."""
+    esc = lambda s: html.escape(s, quote=False)  # noqa: E731
+    when = datetime.fromtimestamp(post.published if post.published is not None else now, YEMEN_TIME)
+    return "\n".join([
+        f"<b>{esc(_shorten(name, 80))}</b>",
+        "",
+        esc(_shorten(post.text, 700)),
+        "",
+        f"🕒 {when.strftime('%H:%M')} بتوقيت اليمن",
+        f'🔗 <a href="{html.escape(post.link, quote=True)}">المنشور الأصلي</a>',
+    ])
+
+
+def forward_post(token, chat_id, name, post, now, log):
+    """Forwards one post (an album as one); if Telegram will not, posts its text and a link."""
+    try:
+        if len(post.ids) == 1:
+            telegram_call(token, "forwardMessage", {
+                "chat_id": chat_id, "from_chat_id": "@" + post.channel, "message_id": post.ids[0]})
+        else:
+            telegram_call(token, "forwardMessages", {
+                "chat_id": chat_id, "from_chat_id": "@" + post.channel, "message_ids": post.ids})
+        return "forwarded"
+    except TelegramError as e:
+        if e.unsure or e.code != 400:
+            raise
+        log(f"{name}: Telegram would not forward post {post.ids[0]} ({e}); posting a link instead")
+    telegram_call(token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": link_message(name, post, now),
+        "parse_mode": "HTML",
+        "link_preview_options": {"url": post.link, "prefer_large_media": True},
+    })
+    return "linked"
+
+
+def forward_new(name, posts, flt, state, token, chat_id, settings, now, log, save=None):
+    """Forwards a channel's new posts about the war, oldest first. Returns how many went out.
+
+    The first time a channel is seen nothing is forwarded: the bot only notes its latest post.
+    """
+    if not posts:
+        return 0
+    channel = posts[0].channel
+    last = state["tg"].get(channel)
+    if last is None:
+        state["tg"][channel] = posts[-1].last_id
+        log(f"{name}: first look; forwarding starts after post {posts[-1].last_id}")
+        return 0
+    todo = [p for p in posts if p.last_id > last]
+    max_age = settings["max_age_hours"] * 3600
+    wanted = [p for p in todo if p.text and p.published is not None and now - p.published <= max_age
+              and flt.keeps(p.text)]
+    cap = settings["max_posts_per_run"]
+    if len(wanted) > cap:
+        log(f"{name}: {len(wanted) - cap} older posts passed over (more than {cap} new in one run)")
+        wanted = wanted[-cap:]
+    sent = 0
+    for p in todo:
+        if p in wanted:
+            if sent:
+                time.sleep(settings["seconds_between_posts"])
+            try:
+                how = forward_post(token, chat_id, name, p, now, log)
+            except TelegramError as e:
+                if e.unsure:
+                    state["tg"][channel] = p.last_id  # it may have gone out: never send it twice
+                    raise
+                if is_setup_problem(e) or e.code != 400:
+                    raise
+                log(f"{name}: Telegram refused post {p.ids[0]}, skipped ({e})")
+                how = None
+            if how:
+                sent += 1
+                log(f"{how}: {name} post {p.ids[0]}")
+        state["tg"][channel] = p.last_id
+        if save:
+            save()
+    return sent
+
+
+def forward_channels(config, state, token, chat_id, now, log=print, save=None):
+    """Forwards the new war posts of every enabled Telegram channel. Returns (tried, read, sent)."""
+    settings = config["settings"]
+    flt = Filter(config)
+    tried = read = sent = 0
+    for feed in config["feeds"]:
+        if not feed.get("enabled", True) or not feed.get("telegram"):
+            continue
+        tried += 1
+        channel = tg_channel(feed["telegram"])
+        try:
+            posts = parse_tg_page(fetch(feed_url(feed, settings)), channel, now)
+        except Exception as e:  # one broken channel must not stop the rest
+            log(f"{feed['name']}: failed ({type(e).__name__}: {e})")
+            continue
+        read += 1
+        log(f"{feed['name']}: {len(posts)} posts")
+        sent += forward_new(feed["name"], posts, flt, state, token, chat_id, settings, now, log, save)
+    return tried, read, sent
+
+
 # ---------------------------------------------------------------- modes
 def run(config, state, token, chat_id, now=None, log=print, save=None):
-    """Posts the new items. Returns how many were posted."""
+    """Posts the new items and forwards the channels' new war posts. Returns how many went out."""
     now = now or time.time()
     settings = config["settings"]
-    fresh = select(collect(config, now, log), Filter(config), state, settings, now)
+    try:
+        items = collect(config, now, log)
+        news_ok = True
+    except FeedsDown:
+        items, news_ok = [], False
+    posted = post_news(items, config, state, token, chat_id, now, log, save) if news_ok else 0
+    tried, read, sent = forward_channels(config, state, token, chat_id, now, log, save)
+    prune(state, now, settings["keep_days"])
+    if not news_ok and not read:
+        raise FeedsDown()
+    return posted + sent
+
+
+def post_news(items, config, state, token, chat_id, now, log=print, save=None):
+    """Posts the new news items. Returns how many were posted."""
+    settings = config["settings"]
+    fresh = select(items, Filter(config), state, settings, now)
     if not state["seeded"]:
         keep = settings["first_run_posts"]
         older, fresh = (fresh[:-keep], fresh[-keep:]) if keep > 0 else (fresh, [])
@@ -579,7 +794,6 @@ def run(config, state, token, chat_id, now=None, log=print, save=None):
         log(f"posted: {it.title} ({it.source})")
         if save:
             save()
-    prune(state, now, settings["keep_days"])
     return posted
 
 
@@ -593,6 +807,9 @@ def check(config, now=None, log=print):
     for feed in config["feeds"]:
         status = "on " if feed.get("enabled", True) else "off"
         url = feed_url(feed, settings)
+        if feed.get("telegram"):
+            check_channel(feed, url, status, flt, now, hours, log)
+            continue
         try:
             items = parse_feed(fetch(url), feed["name"], now)
         except Exception as e:
@@ -612,6 +829,24 @@ def check(config, now=None, log=print):
         for i in sorted(kept, key=lambda i: -i.published)[:5]:
             log(f"      - {i.title} ({i.source})")
     log("Feeds marked [off] are not used until you set \"enabled\": true for them in config.json.")
+
+
+def check_channel(feed, url, status, flt, now, hours, log=print):
+    """Check mode for a Telegram channel: can its page be read, and what would be forwarded."""
+    try:
+        posts = parse_tg_page(fetch(url), tg_channel(feed["telegram"]), now)
+    except Exception as e:
+        log(f"[{status}] {feed['name']}: FAILED ({type(e).__name__}: {e})")
+        log(f"      {url}")
+        return
+    recent = [p for p in posts if p.published is not None and now - p.published <= hours * 3600]
+    kept = [p for p in recent if p.text and flt.keeps(p.text)]
+    log(f"[{status}] {feed['name']}: OK, {len(posts)} posts, {len(recent)} from the last {hours} h, "
+        f"{len(kept)} about the war in Yemen (forwarded)")
+    if not posts:
+        log("      the page answered but showed no posts: is the channel public, and the name right?")
+    for p in sorted(kept, key=lambda p: -p.last_id)[:5]:
+        log(f"      - {_shorten(p.text.splitlines()[0], 100)} ({p.link})")
 
 
 def list_chats(token, log=print):
@@ -639,8 +874,8 @@ def load_config(path):
         if not config.get(key):
             raise SystemExit(f"config.json: '{key}' is missing or empty")
     for feed in config["feeds"]:
-        if not feed.get("name") or not (feed.get("url") or feed.get("google_news")):
-            raise SystemExit(f"config.json: every feed needs a name and a url or google_news query: {feed}")
+        if not feed.get("name") or not (feed.get("url") or feed.get("google_news") or feed.get("telegram")):
+            raise SystemExit(f"config.json: every feed needs a name and a url, a google_news query or a telegram channel: {feed}")
     config["settings"] = {**DEFAULT_SETTINGS, **config.get("settings", {})}
     return config
 

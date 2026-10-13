@@ -26,6 +26,11 @@
       "enabled": true
     },
     {
+      "name": "قناة المسيرة",
+      "telegram": "almasirah2",
+      "enabled": true
+    },
+    {
       "name": "فرانس 24",
       "url": "https://www.france24.com/ar/rss",
       "enabled": false
