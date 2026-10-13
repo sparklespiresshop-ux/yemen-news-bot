@@ -9,7 +9,7 @@ on:
     # Every 15 minutes, away from the top of the hour (GitHub is busiest at :00).
     # In a private repository use "7,37 * * * *" (every 30 minutes) to stay within
     # GitHub's free minutes; see README.md.
-    - cron: "7,22,37,52 * * * *"
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
   workflow_dispatch:
     inputs:
       mode:
