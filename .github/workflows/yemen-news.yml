@@ -1,0 +1,79 @@
+# Posts news about the war in Yemen to a Telegram channel every 15 minutes.
+# Needs two repository secrets (Settings > Secrets and variables > Actions):
+#   TELEGRAM_BOT_TOKEN  the token from @BotFather
+#   TELEGRAM_CHAT_ID    @yourchannel, or a private channel's number (-100...)
+name: Yemen news
+
+on:
+  schedule:
+    # Every 15 minutes, away from the top of the hour (GitHub is busiest at :00).
+    # In a private repository use "7,37 * * * *" (every 30 minutes) to stay within
+    # GitHub's free minutes; see README.md.
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run = post new news; check = test the feeds and post nothing; chat-id = find a private channel's number"
+        type: choice
+        options:
+          - run
+          - check
+          - chat-id
+        default: run
+
+permissions:
+  contents: write  # to save state/seen.json, the list of what was already posted
+
+concurrency:
+  # One posting run at a time, so two runs never post the same news.
+  group: yemen-news-${{ inputs.mode || 'run' }}
+  cancel-in-progress: false
+
+jobs:
+  news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MODE: ${{ inputs.mode || 'run' }}
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}  # the latest commit, with what the previous run saved
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Run the bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py --mode "$MODE"
+
+      - name: Save what was posted
+        if: always() && env.MODE == 'run'
+        run: |
+          if [ ! -f state/seen.json ]; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/seen.json
+          if git diff --cached --quiet; then
+            echo "Nothing new to save."
+            exit 0
+          fi
+          git commit --quiet -m "Update the list of posted news"
+          for attempt in 1 2 3; do
+            if git pull --rebase --quiet && git push --quiet; then
+              echo "Saved."
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 10))
+          done
+          echo "::warning::Could not save state/seen.json this time; the next run may repeat a few posts."
+          exit 1
