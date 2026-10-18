@@ -2661,6 +2661,7 @@
   "https://www.aljazeera.net/?t=1792321666": 1792327566.32766,
   "https://www.aljazeera.net/?t=1792336989": 1792343198.1701179,
   "https://www.aljazeera.net/?t=1792341624": 1792349995.9293728,
+  "https://www.aljazeera.net/?t=1792354054": 1792361282.5171852,
   "https://www.bbc.com/arabic/articles/c6vgj9dy1kmdo#2": 1792314689.3007047,
   "https://www.bbc.com/arabic/articles/c85ynpv4zxwyo#0": 1792266747.0622914,
   "https://www.bbc.com/arabic/articles/cjn5v2dl7ypwo#0": 1791864426.1527128,
@@ -13365,6 +13366,10 @@
   [
    1792360304.5886307,
    "دعم الشرعيه يتصدي لهجمات حوثيه علي السعوديه"
+  ],
+  [
+   1792361282.5171852,
+   "تحتضن مليوني نازح الحوثيون يستهدفون مارب ب8 صواريخ باليستيه"
   ]
  ]
 }
